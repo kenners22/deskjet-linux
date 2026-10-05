@@ -1,0 +1,19 @@
+[package]
+name = "deskjet"
+version = "0.1.0"
+edition = "2024"
+description = "Put an HP DeskJet 3750 on Wi-Fi over USB from Linux (no HPLIP) and print to it with CUPS"
+license = "MIT"
+repository = "https://github.com/kenners22/deskjet-linux"
+
+[dependencies]
+nusb = "0.2.7"
+roxmltree = "0.21.1"
+rpassword = "7.5.4"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

@@ -1,0 +1,3 @@
+# Give the logged-in desktop user access to the HP DeskJet 3700 series over USB
+# (needed for `deskjet wifi`, `usbip`, `networks`).
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="03f0", ATTR{idProduct}=="0653", TAG+="uaccess"
