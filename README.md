@@ -11,8 +11,9 @@ does the same for the SN 420B label printer.
 deskjet wifi [SSID]   join the printer to Wi-Fi over USB (default: the laptop's network)
 deskjet usbip         ask the printer (over USB) what Wi-Fi IP it has
 deskjet networks      list the Wi-Fi networks the printer can see (over USB)
-deskjet find          look for the printer on the network (Bonjour)
-deskjet setup         add/update the CUPS queue "DeskJet3750" (asks for sudo)
+deskjet find          look for the printer on the network
+deskjet setup [IP]    add/update the CUPS queue "DeskJet3750" (asks for sudo)
+deskjet fix           re-find the printer if its IP changed, repoint the queue
 deskjet status        show where it is and whether it's reachable
 deskjet test          print a test page over Wi-Fi and check it was sent
 ```
@@ -29,10 +30,13 @@ interface with class ff/cc/00 (two bulk endpoints, no extra framing), against
 [nusb](https://crates.io/crates/nusb); `ledm.rs` has the requests. The XML
 payloads match HPLIP's `base/LedmWifi.py`; SSID and passphrase go hex-encoded.
 
-**Printing.** `deskjet setup` adds a CUPS queue on the printer's driverless
-URI (`ipps://<Bonjour service name>._ipps._tcp.local/`) with IPP Everywhere.
-CUPS resolves the name on every job, so a new DHCP address doesn't matter, and
-jobs sent while the printer is off wait (`printer-error-policy=retry-job`).
+**Printing.** `deskjet setup` finds the printer on your /24 by asking each
+host's web server for `/DevMgmt/ProductConfigDyn.xml` (the printer answers
+with its product name), then adds a CUPS queue at `ipps://<ip>/ipp/print` with
+IPP Everywhere and A4 as the default paper. Jobs sent while the printer is off
+wait (`printer-error-policy=retry-job`). If DHCP ever moves the printer,
+`deskjet fix` finds it again and repoints the queue; better still, reserve its
+address in your router (`deskjet wifi` prints the IP and MAC to reserve).
 
 ## Things learned on this printer
 
@@ -44,7 +48,13 @@ jobs sent while the printer is off wait (`printer-error-policy=retry-job`).
   laptop's port needed a replug. `deskjet wifi` scans first and only switches
   the radio on if the scan comes back empty.
 - Its Bonjour host name (`HP` + MAC) differs from the hostname it reports over
-  USB (`HP` + last six MAC digits).
+  USB (`HP` + last six MAC digits). Bonjour names also stopped resolving
+  altogether once the laptop roamed onto a Wi-Fi extender, which left CUPS
+  "Unable to locate printer". Hence the queue points at the IP address.
+- If an app sends US Letter while A4 is loaded, the printer prints one page,
+  then stops with "size mismatch in tray" until a button is pressed. Linux
+  apps follow the locale's paper size: with `LANG=en_US.UTF-8`, set
+  `LC_PAPER=en_GB.UTF-8` (and `/etc/papersize` to `a4`) to get A4.
 - It also listens on raw port 9100, so tools that find printers by scanning
   for 9100 will see it.
 - CUPS's own `testprint` is a banner file that cups-filters 2 rejects, yet
@@ -54,9 +64,8 @@ jobs sent while the printer is off wait (`printer-error-policy=retry-job`).
 
 ## Install
 
-Needs Rust (`cargo`), CUPS with cups-filters (`lp`, `lpstat`, `lpadmin`,
-`driverless`) and Avahi (`avahi-browse`, plus `nss-mdns` so `.local` names
-resolve). On Arch: `sudo pacman -S --needed rust cups cups-filters avahi nss-mdns`.
+Needs Rust (`cargo`), and CUPS with cups-filters (`lp`, `lpstat`, `lpadmin`).
+On Arch: `sudo pacman -S --needed rust cups cups-filters`.
 
 ```bash
 git clone https://github.com/kenners22/deskjet-linux
@@ -81,7 +90,7 @@ Without the udev rule, `deskjet` asks for sudo once to run
 5. Unplug the USB cable. From now on, switch the printer on and print to
    `DeskJet3750` from any app.
 
-State: `~/.config/deskjet.conf` (`HOST=`, the printer's Bonjour host name).
+State: `~/.config/deskjet.conf` (`IP=`, the printer's address).
 
 ## Tested with
 

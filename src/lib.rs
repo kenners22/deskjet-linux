@@ -2,14 +2,15 @@
 //!
 //! Wi-Fi is set over USB the way HP's hp-wificonfig does it (LEDM: small HTTP
 //! requests down the printer's USB interface), spoken directly — no HPLIP.
-//! The CUPS queue uses the printer's Bonjour service name and the driverless
-//! IPP Everywhere driver, so a new DHCP address needs no fix step.
+//! The CUPS queue points at the printer's address with the driverless IPP
+//! Everywhere driver; `fix` re-finds it if DHCP moves it.
 
 mod ledm;
 mod pdf;
 mod usb;
 
-use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::io::{Read, Write};
+use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::path::PathBuf;
 use std::process::{Command, ExitCode, Stdio};
 use std::thread::sleep;
@@ -25,8 +26,9 @@ deskjet — join the HP DeskJet 3750 to Wi-Fi over USB and print to it over Wi-F
   deskjet wifi [SSID]   join the printer to Wi-Fi over USB (default: the laptop's network)
   deskjet usbip         ask the printer (over USB) what Wi-Fi IP it has
   deskjet networks      list the Wi-Fi networks the printer can see (over USB)
-  deskjet find          look for the printer on the network (Bonjour)
-  deskjet setup         add/update the CUPS queue \"DeskJet3750\" (asks for sudo)
+  deskjet find          look for the printer on the network
+  deskjet setup [IP]    add/update the CUPS queue \"DeskJet3750\" (asks for sudo)
+  deskjet fix           re-find the printer if its IP changed, repoint the queue
   deskjet status        show where it is and whether it's reachable
   deskjet test          print a test page over Wi-Fi and check it was sent";
 
@@ -44,16 +46,16 @@ fn conf_path() -> PathBuf {
     base.join("deskjet.conf")
 }
 
-/// Saved Bonjour host name (same `HOST=` file the old shell script used).
-fn load_host() -> Option<String> {
+/// Saved printer address (`IP=`). Older versions saved a Bonjour `HOST=`.
+fn load_ip() -> Option<Ipv4Addr> {
     let s = std::fs::read_to_string(conf_path()).ok()?;
-    s.lines().find_map(|l| l.strip_prefix("HOST=")).map(str::trim).filter(|h| !h.is_empty()).map(String::from)
+    s.lines().find_map(|l| l.strip_prefix("IP=")).and_then(|v| v.trim().parse().ok())
 }
 
-fn save_host(host: &str) -> Res {
+fn save_ip(ip: Ipv4Addr) -> Res {
     let p = conf_path();
     if let Some(d) = p.parent() { std::fs::create_dir_all(d).map_err(|e| e.to_string())?; }
-    std::fs::write(&p, format!("HOST={host}\n")).map_err(|e| e.to_string())
+    std::fs::write(&p, format!("IP={ip}\n")).map_err(|e| e.to_string())
 }
 
 fn output(cmd: &str, args: &[&str]) -> String {
@@ -70,18 +72,68 @@ fn run_cmd(cmd: &str, args: &[&str]) -> Res {
     if ok { Ok(()) } else { Err(format!("{cmd} failed")) }
 }
 
-/// Bonjour IPP printers on the LAN that look like HPs: (host.local, address).
-fn browse() -> Vec<(String, String)> {
-    let mut hits: Vec<(String, String)> = output("timeout", &["8", "avahi-browse", "-rtp", "_ipp._tcp"])
-        .lines()
-        .map(|l| l.split(';').collect::<Vec<_>>())
-        .filter(|f| f.len() > 7 && f[0] == "=" && f[2] == "IPv4")
-        .filter(|f| { let n = f[3].to_ascii_lowercase(); n.contains("hp") || n.contains("deskjet") })
-        .map(|f| (f[6].to_string(), f[7].to_string()))
+/// First three octets of the network the default route uses, e.g. 192.168.1.
+fn subnet() -> Option<[u8; 3]> {
+    let route = output("ip", &["-4", "route"]);
+    let dev = route.lines().find(|l| l.starts_with("default"))?
+        .split_whitespace().skip_while(|w| *w != "dev").nth(1)?.to_string();
+    let addr = output("ip", &["-4", "-o", "addr", "show", "dev", &dev]);
+    let ip: Ipv4Addr = addr.split_whitespace().skip_while(|w| *w != "inet").nth(1)?
+        .split('/').next()?.parse().ok()?;
+    let o = ip.octets();
+    Some([o[0], o[1], o[2]])
+}
+
+fn port_open(ip: Ipv4Addr, port: u16) -> bool {
+    TcpStream::connect_timeout(&SocketAddr::from((ip, port)), Duration::from_secs(1)).is_ok()
+}
+
+/// Is this a DeskJet 3700-series printer? Its web server answers the same
+/// LEDM resources as the USB interface, including the product name.
+/// (Bonjour names would be nicer, but they stop resolving on some networks,
+/// e.g. once the laptop roams onto a Wi-Fi extender.)
+fn is_deskjet(ip: Ipv4Addr) -> bool {
+    let Ok(mut s) = TcpStream::connect_timeout(&SocketAddr::from((ip, 80)), Duration::from_secs(1)) else { return false };
+    let _ = s.set_read_timeout(Some(Duration::from_secs(3)));
+    let req = format!("GET /DevMgmt/ProductConfigDyn.xml HTTP/1.0\r\nHost: {ip}\r\n\r\n");
+    if s.write_all(req.as_bytes()).is_err() { return false; }
+    let mut body = Vec::new();
+    let _ = s.take(256 * 1024).read_to_end(&mut body);
+    String::from_utf8_lossy(&body).contains("DeskJet 3700")
+}
+
+/// Every DeskJet 3700 on this /24, all hosts tried at once.
+fn scan() -> Res<Vec<Ipv4Addr>> {
+    let [a, b, c] = subnet().ok_or("not connected to a network")?;
+    eprintln!("Looking for the printer on {a}.{b}.{c}.0/24…");
+    let checks: Vec<_> = (1..=254u8)
+        .map(|d| {
+            let ip = Ipv4Addr::new(a, b, c, d);
+            std::thread::spawn(move || is_deskjet(ip).then_some(ip))
+        })
         .collect();
-    hits.sort();
-    hits.dedup();
-    hits
+    Ok(checks.into_iter().filter_map(|t| t.join().ok().flatten()).collect())
+}
+
+fn one(hits: Vec<Ipv4Addr>) -> Res<Ipv4Addr> {
+    match hits.as_slice() {
+        [ip] => Ok(*ip),
+        [] => Err("printer not found on the network — is it on and joined to Wi-Fi? (deskjet wifi)".into()),
+        _ => Err(format!("found {} DeskJets ({hits:?}) — run: deskjet setup <IP>", hits.len())),
+    }
+}
+
+fn uri(ip: Ipv4Addr) -> String {
+    format!("ipps://{ip}/ipp/print")
+}
+
+/// MAC for an address from the kernel's ARP table.
+fn mac_of(ip: Ipv4Addr) -> String {
+    std::fs::read_to_string("/proc/net/arp").unwrap_or_default().lines().skip(1)
+        .map(|l| l.split_whitespace().collect::<Vec<_>>())
+        .find(|f| f.len() > 3 && f[0] == ip.to_string() && f[3] != "00:00:00:00:00:00")
+        .map(|f| f[3].to_uppercase())
+        .unwrap_or_default()
 }
 
 /// The Wi-Fi network this laptop is on (NetworkManager or iwd), as the default.
@@ -137,10 +189,11 @@ fn cmd_wifi(ssid: Option<String>) -> Res {
     };
     let host = ledm::hostname(&mut p).ok().flatten().unwrap_or_default();
     eprintln!("Printer joined \"{ssid}\" at {ip} ({host})");
-    // Its Bonjour name (HP + MAC) differs from the hostname it reports over USB.
-    if let Some((name, _)) = browse().into_iter().find(|(_, a)| *a == ip.to_string()) {
-        save_host(&name)?;
-        eprintln!("Network name: {name}");
+    save_ip(ip)?;
+    let _ = port_open(ip, 80); // fills the ARP entry so the MAC can be shown
+    let mac = mac_of(ip);
+    if !mac.is_empty() {
+        eprintln!("Tip: reserve {ip} for MAC {mac} in your router's DHCP settings so it never moves.");
     }
     eprintln!("Next: deskjet setup");
     Ok(())
@@ -167,37 +220,54 @@ fn cmd_networks() -> Res {
 }
 
 fn cmd_find() -> Res {
-    let hits = browse();
-    if hits.is_empty() { return Err("No HP printer found. Is it on and joined to Wi-Fi?".into()); }
-    for (host, addr) in hits { out!("{host}  {addr}"); }
+    for ip in one_or_all(scan()?)? { out!("{ip}  {}", mac_of(ip)); }
     Ok(())
 }
 
-fn cmd_setup() -> Res {
-    // CUPS's driverless URI names the printer's Bonjour service, which CUPS
-    // resolves on every job — so a new DHCP address doesn't matter.
-    let uri = output("timeout", &["20", "driverless"])
-        .lines()
-        .find(|l| l.to_ascii_lowercase().contains("deskjet%203700"))
-        .map(String::from)
-        .ok_or("printer not found on the network — is it on and joined to Wi-Fi? (deskjet wifi)")?;
-    eprintln!("Setting up queue {QUEUE} → {uri} (sudo needed)");
-    run_cmd("sudo", &["lpadmin", "-p", QUEUE, "-E", "-v", &uri, "-m", "everywhere",
-        "-D", "HP DeskJet 3750", "-L", "Wi-Fi", "-o", "printer-error-policy=retry-job"])?;
+fn one_or_all(hits: Vec<Ipv4Addr>) -> Res<Vec<Ipv4Addr>> {
+    if hits.is_empty() { one(hits).map(|ip| vec![ip]) } else { Ok(hits) }
+}
+
+fn queue(ip: Ipv4Addr) -> Res {
+    let u = uri(ip);
+    eprintln!("Setting up queue {QUEUE} → {u} (sudo needed)");
+    run_cmd("sudo", &["lpadmin", "-p", QUEUE, "-E", "-v", &u, "-m", "everywhere",
+        "-D", "HP DeskJet 3750", "-L", "Wi-Fi", "-o", "printer-error-policy=retry-job",
+        "-o", "media-default=iso_a4_210x297mm"])
+}
+
+fn cmd_setup(target: Option<String>) -> Res {
+    let ip = match target {
+        Some(t) => t.parse().map_err(|_| format!("not an IP address: {t}"))?,
+        None => one(scan()?)?,
+    };
+    if !is_deskjet(ip) { return Err(format!("{ip} doesn't answer as a DeskJet 3700")); }
+    save_ip(ip)?;
+    queue(ip)?;
     eprintln!("Done. Print with: lp -d {QUEUE} file.pdf");
     Ok(())
 }
 
-fn cmd_status() -> Res {
-    let host = load_host().ok_or("Not set up yet — run: deskjet wifi, then deskjet setup")?;
-    let addr: Option<SocketAddr> =
-        (host.as_str(), 631).to_socket_addrs().ok().and_then(|mut a| a.find(SocketAddr::is_ipv4));
-    match addr {
-        Some(a) => out!("Printer: {host} ({})", a.ip()),
-        None => out!("Printer: {host}"),
+/// If DHCP gave the printer a new address, find it again and repoint the queue.
+fn cmd_fix() -> Res {
+    let saved = load_ip().ok_or("no saved printer — run: deskjet setup")?;
+    let current = output("lpstat", &["-v", QUEUE]);
+    if is_deskjet(saved) && current.contains(&uri(saved)) {
+        eprintln!("Printer still at {saved} — nothing to fix.");
+        return Ok(());
     }
-    let up = addr.is_some_and(|a| TcpStream::connect_timeout(&a, Duration::from_secs(2)).is_ok());
-    out!("Wi-Fi:   {}", if up { "reachable" } else { "NOT reachable (is it switched on?)" });
+    let ip = if is_deskjet(saved) { saved } else { one(scan()?)? };
+    save_ip(ip)?;
+    eprintln!("Printer is at {ip}; updating queue (sudo needed)");
+    run_cmd("sudo", &["lpadmin", "-p", QUEUE, "-v", &uri(ip)])?;
+    run_cmd("sudo", &["cupsenable", QUEUE])
+}
+
+fn cmd_status() -> Res {
+    let ip = load_ip().ok_or("Not set up yet — run: deskjet wifi, then deskjet setup")?;
+    out!("Printer: {ip}");
+    let up = port_open(ip, 631);
+    out!("Wi-Fi:   {}", if up { "reachable" } else { "NOT reachable (switched on? else: deskjet fix)" });
     let q = output("lpstat", &["-p", QUEUE, "-v", QUEUE]);
     if q.is_empty() { out!("CUPS queue {QUEUE}: not installed"); } else { out!("{}", q.trim_end()); }
     Ok(())
@@ -248,7 +318,8 @@ pub fn run(args: Vec<String>) -> ExitCode {
         "usbip" => cmd_usbip(),
         "networks" => cmd_networks(),
         "find" => cmd_find(),
-        "setup" => cmd_setup(),
+        "setup" => cmd_setup(args.next()),
+        "fix" => cmd_fix(),
         "status" => cmd_status(),
         "test" => cmd_test(),
         _ => { out!("{HELP}"); Ok(()) }
